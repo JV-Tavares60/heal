@@ -7,14 +7,12 @@ export async function GET() {
   try {
     const supabase = createServiceClient();
     const now = new Date();
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .replace("T", " ")
-      .slice(0, 19);
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .replace("T", " ")
-      .slice(0, 19);
+    const sevenDaysAgo = new Date(
+      now.getTime() - 7 * 24 * 60 * 60 * 1000
+    ).toISOString();
+    const thirtyDaysAgo = new Date(
+      now.getTime() - 30 * 24 * 60 * 60 * 1000
+    ).toISOString();
 
     // Fetch all users (service role bypasses RLS)
     const { data: users, error: usersError } = await supabase
@@ -23,37 +21,67 @@ export async function GET() {
 
     if (usersError) throw usersError;
 
-    // Fetch chat histories (service role bypasses RLS)
+    // Fetch chat histories with created_at for time-based metrics
     const { data: chatHistories, error: chatError } = await supabase
       .from("n8n_chat_histories")
-      .select("id, session_id, message");
+      .select("id, session_id, message, created_at");
 
     if (chatError) throw chatError;
+
+    // === Build session activity map from chat_histories ===
+    // For each session, find the latest message timestamp
+    const sessionLastActivity: Record<string, string> = {};
+    chatHistories?.forEach((ch) => {
+      if (ch.created_at && ch.message?.type === "human") {
+        const current = sessionLastActivity[ch.session_id];
+        if (!current || ch.created_at > current) {
+          sessionLastActivity[ch.session_id] = ch.created_at;
+        }
+      }
+    });
+
+    // Merge: use chat_histories created_at OR users.last_message (whichever is more recent)
+    const getUserLastActivity = (user: {
+      session_id?: string;
+      last_message?: string;
+    }): string | null => {
+      const fromChat = user.session_id
+        ? sessionLastActivity[user.session_id]
+        : null;
+      const fromUser = user.last_message;
+      if (fromChat && fromUser) return fromChat > fromUser ? fromChat : fromUser;
+      return fromChat || fromUser || null;
+    };
 
     // === BLOCO 1: KPIs ===
     const totalUsers = users?.length ?? 0;
 
     const activeUsers7d =
-      users?.filter(
-        (u) => u.last_message && u.last_message >= sevenDaysAgo
-      ).length ?? 0;
+      users?.filter((u) => {
+        const lastActivity = getUserLastActivity(u);
+        return lastActivity && lastActivity >= sevenDaysAgo;
+      }).length ?? 0;
 
     const activeUsers30d =
-      users?.filter(
-        (u) => u.last_message && u.last_message >= thirtyDaysAgo
-      ).length ?? 0;
+      users?.filter((u) => {
+        const lastActivity = getUserLastActivity(u);
+        return lastActivity && lastActivity >= thirtyDaysAgo;
+      }).length ?? 0;
 
-    // Users with no return: only 1 message or last_message == created_at
+    // Users with no return: 0 or 1 human messages
+    const sessionHumanCounts: Record<string, number> = {};
+    chatHistories?.forEach((ch) => {
+      if (ch.message?.type === "human") {
+        sessionHumanCounts[ch.session_id] =
+          (sessionHumanCounts[ch.session_id] || 0) + 1;
+      }
+    });
+
     const usersNoReturn =
       users?.filter((u) => {
-        if (!u.last_message) return true;
-        // Check if user has no chat history
-        const userMessages = chatHistories?.filter(
-          (ch) =>
-            ch.session_id === u.session_id &&
-            ch.message?.type === "human"
-        );
-        return !userMessages || userMessages.length <= 1;
+        if (!u.session_id) return true;
+        const humanCount = sessionHumanCounts[u.session_id] ?? 0;
+        return humanCount <= 1;
       }).length ?? 0;
 
     // === BLOCO 2: Behavior ===
@@ -67,7 +95,6 @@ export async function GET() {
       }
     });
 
-    // Fill missing days
     const newUsersChart = [];
     for (let i = 29; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
@@ -75,16 +102,12 @@ export async function GET() {
       newUsersChart.push({ date: key, count: newUsersPerDay[key] || 0 });
     }
 
-    // Messages per day (last 30 days)
-    // Use users.last_message as a proxy for message activity per day
+    // Messages per day (last 30 days) — from chat_histories.created_at
     const msgsPerDay: Record<string, number> = {};
-    users?.forEach((u) => {
-      if (u.last_message && u.last_message >= thirtyDaysAgo) {
-        const day = u.last_message.slice(0, 10);
-        const userMsgCount = chatHistories?.filter(
-          (ch) => ch.session_id === u.session_id
-        ).length ?? 0;
-        msgsPerDay[day] = (msgsPerDay[day] || 0) + Math.max(userMsgCount, 1);
+    chatHistories?.forEach((ch) => {
+      if (ch.created_at && ch.created_at >= thirtyDaysAgo) {
+        const day = ch.created_at.slice(0, 10);
+        msgsPerDay[day] = (msgsPerDay[day] || 0) + 1;
       }
     });
 
@@ -127,7 +150,7 @@ export async function GET() {
         };
       });
 
-    // Message distribution: human vs ai vs tool
+    // Message distribution: human vs ai
     let humanMessages = 0;
     let aiMessages = 0;
     chatHistories?.forEach((ch) => {
@@ -160,9 +183,10 @@ export async function GET() {
 
     // Response rate after follow-up
     const usersWithFupSent = users?.filter((u) => u.fup_sent) ?? [];
-    const respondedAfterFup = usersWithFupSent.filter(
-      (u) => u.last_message && u.last_message > u.fup_sent
-    );
+    const respondedAfterFup = usersWithFupSent.filter((u) => {
+      const lastActivity = getUserLastActivity(u);
+      return lastActivity && lastActivity > u.fup_sent;
+    });
     const fupResponseRate =
       usersWithFupSent.length > 0
         ? Math.round(
@@ -172,7 +196,10 @@ export async function GET() {
 
     // Users who received follow-up but didn't respond
     const fupNoResponse = usersWithFupSent
-      .filter((u) => !u.last_message || u.last_message <= u.fup_sent)
+      .filter((u) => {
+        const lastActivity = getUserLastActivity(u);
+        return !lastActivity || lastActivity <= u.fup_sent;
+      })
       .map((u) => ({
         name: u.name || "Desconhecido",
         phone: u.phone || "-",

@@ -112,6 +112,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchData();
+    // Auto-refresh every 5 minutes
+    const interval = setInterval(fetchData, 5 * 60 * 1000);
+    return () => clearInterval(interval);
   }, [fetchData]);
 
   if (loading) {
